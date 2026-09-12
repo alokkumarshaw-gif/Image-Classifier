@@ -1,4 +1,4 @@
-"""Flask API for classifying image uploads with ImageNet MobileNetV3."""
+"""Flask API for animal/bird detection using the custom YOLO model."""
 
 from __future__ import annotations
 
@@ -12,94 +12,187 @@ from PIL import Image, UnidentifiedImageError
 
 app = Flask(__name__)
 CORS(app)
+
+# Maximum uploaded image size: 8 MB
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 
+# Custom trained YOLO model
+MODEL_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "models",
+    "best.pt",
+)
+
+# Minimum confidence for a detection
+CONFIDENCE_THRESHOLD = 0.40
+
 
 def allowed_file(filename: str) -> bool:
-    """Return whether filename has a supported image extension."""
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+    """Return whether the filename has a supported image extension."""
+    return (
+        "." in filename
+        and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+    )
 
 
 @lru_cache(maxsize=1)
 def get_model():
-    """Load MobileNet only once, avoiding startup work until first upload."""
-    import torch
-    from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
+    """Load the custom YOLO model once and reuse it."""
+    from ultralytics import YOLO
 
-    weights = MobileNet_V3_Small_Weights.DEFAULT
-    model = mobilenet_v3_small(weights=weights)
-    model.eval()
-    return model, weights, torch
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"Custom model not found at: {MODEL_PATH}"
+        )
 
-
-def demo_prediction(image: Image.Image) -> list[dict[str, float | str]]:
-    """Provide a usable offline fallback when explicitly enabled for demos."""
-    rgb = image.convert("RGB").resize((1, 1))
-    red, green, blue = rgb.getpixel((0, 0))
-    labels = [(red, "warm-toned image"), (green, "natural / green scene"), (blue, "cool-toned image")]
-    labels.sort(reverse=True)
-    return [
-        {"label": f"{label} (demo analysis)", "confidence": round(58 - position * 13 + value / 255 * 20, 2)}
-        for position, (value, label) in enumerate(labels)
-    ]
+    return YOLO(MODEL_PATH)
 
 
-def classify(image: Image.Image) -> list[dict[str, float | str]]:
-    """Return the three most likely ImageNet labels for an opened image."""
-    if os.getenv("CLASSIFIER_MODE", "").lower() == "demo":
-        return demo_prediction(image)
+def classify(image: Image.Image) -> list[dict]:
+    """
+    Run the custom YOLO detector and return detected classes,
+    confidence values, and bounding boxes.
+    """
+    model = get_model()
 
-    model, weights, torch = get_model()
-    tensor = weights.transforms()(image.convert("RGB")).unsqueeze(0)
-    with torch.inference_mode():
-        probabilities = torch.nn.functional.softmax(model(tensor)[0], dim=0)
-    top_probabilities, top_categories = torch.topk(probabilities, 3)
-    return [
-        {
-            "label": weights.meta["categories"][category.item()].replace("_", " "),
-            "confidence": round(probability.item() * 100, 2),
-        }
-        for probability, category in zip(top_probabilities, top_categories)
-    ]
+    # YOLO accepts PIL images directly.
+    results = model.predict(
+        source=image.convert("RGB"),
+        conf=CONFIDENCE_THRESHOLD,
+        verbose=False,
+    )
+
+    predictions: list[dict] = []
+
+    if not results:
+        return predictions
+
+    result = results[0]
+
+    if result.boxes is None or len(result.boxes) == 0:
+        return predictions
+
+    names = result.names
+
+    for box in result.boxes:
+        class_id = int(box.cls.item())
+        confidence = float(box.conf.item())
+
+        xyxy = box.xyxy[0].tolist()
+        x1, y1, x2, y2 = xyxy
+
+        predictions.append(
+            {
+                "label": str(names[class_id]),
+                "confidence": round(confidence * 100, 2),
+                "box": {
+                    "x": round(x1, 2),
+                    "y": round(y1, 2),
+                    "width": round(x2 - x1, 2),
+                    "height": round(y2 - y1, 2),
+                },
+            }
+        )
+
+    # Highest-confidence detections first
+    predictions.sort(
+        key=lambda item: item["confidence"],
+        reverse=True,
+    )
+
+    # Return at most the top 5 detections
+    return predictions[:5]
 
 
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok"})
+    """Health check endpoint."""
+    return jsonify(
+        {
+            "status": "ok",
+            "model": "custom YOLO",
+            "model_path": MODEL_PATH,
+        }
+    )
 
 
 @app.post("/api/classify")
 def classify_image():
+    """Accept an image upload and return YOLO detections."""
     uploaded = request.files.get("image")
+
     if uploaded is None or not uploaded.filename:
-        return jsonify({"error": "Choose an image to classify."}), 400
+        return jsonify(
+            {"error": "Choose an image to classify."}
+        ), 400
+
     if not allowed_file(uploaded.filename):
-        return jsonify({"error": "Use a JPG, PNG, or WebP image."}), 400
+        return jsonify(
+            {"error": "Use a JPG, PNG, or WebP image."}
+        ), 400
 
     try:
         contents = uploaded.read()
+
+        if not contents:
+            return jsonify(
+                {"error": "The uploaded image is empty."}
+            ), 400
+
         image = Image.open(io.BytesIO(contents))
         image.verify()
-        image = Image.open(io.BytesIO(contents))
+
+        # Re-open because verify() exhausts the image object.
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+
     except (UnidentifiedImageError, OSError):
-        return jsonify({"error": "That file could not be read as an image."}), 400
+        return jsonify(
+            {"error": "That file could not be read as an image."}
+        ), 400
 
     try:
         predictions = classify(image)
-    except (UnidentifiedImageError, OSError):
-        return jsonify({"error": "That file could not be read as an image."}), 400
-    except Exception as exc:  # Model downloads and runtime errors should be actionable to users.
-        app.logger.exception("Classification failed")
-        return jsonify({"error": f"Classification could not run: {exc}"}), 503
 
-    return jsonify({"predictions": predictions})
+    except FileNotFoundError as exc:
+        app.logger.exception("Model file missing")
+        return jsonify(
+            {"error": str(exc)}
+        ), 500
+
+    except Exception as exc:
+        app.logger.exception("Detection failed")
+        return jsonify(
+            {"error": f"Detection could not run: {exc}"}
+        ), 503
+
+    # No object passed the confidence threshold.
+    if not predictions:
+        return jsonify(
+            {
+                "predictions": [],
+                "message": (
+                    "No supported animal or bird was detected "
+                    f"with confidence >= "
+                    f"{CONFIDENCE_THRESHOLD * 100:.0f}%."
+                ),
+            }
+        )
+
+    return jsonify(
+        {
+            "predictions": predictions,
+        }
+    )
 
 
 @app.errorhandler(413)
 def file_too_large(_error):
-    return jsonify({"error": "Image must be 8 MB or smaller."}), 413
+    """Handle images larger than 8 MB."""
+    return jsonify(
+        {"error": "Image must be 8 MB or smaller."}
+    ), 413
 
 
 if __name__ == "__main__":
