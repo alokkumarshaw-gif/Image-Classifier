@@ -60,7 +60,7 @@ function App() {
     <main>
       <header>
         <a className="brand" href="/" aria-label="Focus home"><span>✦</span> FOCUS</a>
-        <p>IMAGE INTELLIGENCE, SIMPLIFIED</p>
+        <p>Techviman Image Classifier</p>
       </header>
       <section className="hero">
         <div className="eyebrow">MOBILENET V3 · IMAGENET</div>
@@ -96,7 +96,7 @@ function App() {
           </button>
         </div>
       </section>
-      <footer><span>PRIVATE BY DESIGN</span><span>Images are processed for your request and never stored.</span></footer>
+      <footer><span>Developed by TECHVIMAN</span><span>Images are processed for your request and never stored.</span></footer>
     </main>
   )
 }
